@@ -18,7 +18,7 @@ pub struct Mutex<T> {
 unsafe impl<T> Sync for Mutex<T> where T: Send {}
 
 pub struct MutexGuard<'a, T> {
-    mutex: &'a Mutex<T>,
+    pub(crate) mutex: &'a Mutex<T>,
 }
 
 unsafe impl<T> Send for MutexGuard<'_, T> where T: Send {}
@@ -78,5 +78,30 @@ impl<T> Drop for MutexGuard<'_, T> {
         if self.mutex.state.swap(0, Release) == 2 {
             wake_one(&self.mutex.state);
         };
+    }
+}
+
+mod test {
+    #[allow(unused_imports)]
+    use super::Mutex;
+    #[allow(unused_imports)]
+    use std::{thread, time::Instant};
+
+    #[test]
+    fn test_locks() {
+        let m = Mutex::new(0);
+        std::hint::black_box(&m);
+        let start = Instant::now();
+        thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..5_000_000 {
+                        *m.lock() += 1;
+                    }
+                });
+            }
+        });
+        let duration = start.elapsed();
+        println!("locked {} times in {:?}", *m.lock(), duration);
     }
 }
