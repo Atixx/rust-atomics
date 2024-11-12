@@ -10,6 +10,8 @@ use atomic_wait::{wait, wake_all, wake_one};
 pub struct RwLock<T> {
     /// number of readers, or u32::MAX if write-locked
     state: AtomicU32,
+    /// Incremented to wake up writers.
+    writer_wake_counter: AtomicU32,
     value: UnsafeCell<T>,
 }
 
@@ -19,6 +21,7 @@ impl<T> RwLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicU32::new(0),
+            writer_wake_counter: AtomicU32::new(0),
             value: UnsafeCell::new(value),
         }
     }
@@ -42,8 +45,17 @@ impl<T> RwLock<T> {
     }
 
     pub fn write(&self) -> WriteGuard<T> {
-        while let Err(s) = self.state.compare_exchange(0, u32::MAX, Acquire, Relaxed) {
-            wait(&self.state, s);
+        while self
+            .state
+            .compare_exchange(0, u32::MAX, Acquire, Relaxed)
+            .is_err()
+        {
+            let w = self.writer_wake_counter.load(Acquire);
+            if self.state.load(Relaxed) != 0 {
+                // Wait if the RwLock is still locked, but only if
+                // there have been no wake signals since we checked
+                wait(&self.writer_wake_counter, w);
+            }
         }
         WriteGuard { rwlock: self }
     }
@@ -56,7 +68,8 @@ pub struct ReadGuard<'a, T> {
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
         if self.rwlock.state.fetch_sub(1, Release) == 1 {
-            wake_one(&self.rwlock.state);
+            self.rwlock.writer_wake_counter.fetch_add(1, Release);
+            wake_one(&self.rwlock.writer_wake_counter);
         }
     }
 }
@@ -75,6 +88,8 @@ pub struct WriteGuard<'a, T> {
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
         self.rwlock.state.store(0, Release);
+        self.rwlock.writer_wake_counter.fetch_add(1, Release);
+        wake_one(&self.rwlock.writer_wake_counter);
         wake_all(&self.rwlock.state);
     }
 }
