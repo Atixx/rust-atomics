@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::u32;
 use std::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
@@ -8,7 +9,11 @@ use std::{
 use atomic_wait::{wait, wake_all, wake_one};
 
 pub struct RwLock<T> {
-    /// number of readers, or u32::MAX if write-locked
+    /// The number of read locks times two, plus one if there's a writer waiting.
+    /// u32::MAX if write locked.
+    ///
+    /// This means that readers may acquire the lock when
+    /// the state is even, but need to block when odd.
     state: AtomicU32,
     /// Incremented to wake up writers.
     writer_wake_counter: AtomicU32,
@@ -29,35 +34,54 @@ impl<T> RwLock<T> {
     pub fn read(&self) -> ReadGuard<T> {
         let mut s = self.state.load(Relaxed);
         loop {
-            if s < u32::MAX {
-                assert!(s < u32::MAX - 1, "too many readers");
-                match self.state.compare_exchange_weak(s, s + 1, Acquire, Relaxed) {
+            if s % 2 == 0 {
+                // Even, only readers waiting.
+                assert!(s < u32::MAX - 2, "too many readers");
+                match self.state.compare_exchange_weak(s, s + 2, Acquire, Relaxed) {
                     Ok(_) => return ReadGuard { rwlock: self },
                     Err(e) => s = e,
                 }
             }
 
-            if s == u32::MAX {
-                wait(&self.state, u32::MAX);
+            if s % 2 == 1 {
+                // Odd, a writer waiting.
+                wait(&self.state, s);
                 s = self.state.load(Relaxed)
             }
         }
     }
 
     pub fn write(&self) -> WriteGuard<T> {
-        while self
-            .state
-            .compare_exchange(0, u32::MAX, Acquire, Relaxed)
-            .is_err()
-        {
+        let mut s = self.state.load(Relaxed);
+        loop {
+            // Try to lock if unlocked
+            if s <= 1 {
+                match self.state.compare_exchange(s, u32::MAX, Acquire, Relaxed) {
+                    Ok(_) => return WriteGuard { rwlock: self },
+                    Err(e) => {
+                        s = e;
+                        continue;
+                    }
+                }
+            }
+            // block new readers by making sure state is odd
+            if s % 2 == 0 {
+                match self.state.compare_exchange(s, s + 1, Relaxed, Relaxed) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        s = e;
+                        continue;
+                    }
+                }
+            }
+            // Wait, if it's still locked
             let w = self.writer_wake_counter.load(Acquire);
-            if self.state.load(Relaxed) != 0 {
-                // Wait if the RwLock is still locked, but only if
-                // there have been no wake signals since we checked
+            s = self.state.load(Relaxed);
+            if s >= 2 {
                 wait(&self.writer_wake_counter, w);
+                s = self.state.load(Relaxed)
             }
         }
-        WriteGuard { rwlock: self }
     }
 }
 
@@ -67,7 +91,11 @@ pub struct ReadGuard<'a, T> {
 
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
-        if self.rwlock.state.fetch_sub(1, Release) == 1 {
+        // Decrementing by 2 since this is a read locks
+        if self.rwlock.state.fetch_sub(2, Release) == 3 {
+            // If we decremented from 3 to 1, that means
+            // the RwLock is now unlocked _and_ there is
+            // a waiting writer, which we wake up.
             self.rwlock.writer_wake_counter.fetch_add(1, Release);
             wake_one(&self.rwlock.writer_wake_counter);
         }
